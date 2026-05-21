@@ -104,6 +104,55 @@ function buildConfigSchematics() {
         max: 8,
       },
       3,
+    )
+    .field(
+      "topK",
+      "numeric",
+      {
+        displayName: "Top-K results returned",
+        subtitle:
+          "Final number of best-scoring results returned to the model after filtering & ranking (1–25).",
+        int: true,
+        min: 1,
+        max: 25,
+      },
+      8,
+    )
+    .field(
+      "snippetMaxChars",
+      "numeric",
+      {
+        displayName: "Snippet length cap (chars)",
+        subtitle:
+          "Trim long snippets to save context. Lower = less noise, higher = more evidence per result.",
+        int: true,
+        min: 80,
+        max: 2000,
+      },
+      240,
+    )
+    .field(
+      "cacheTtlSec",
+      "numeric",
+      {
+        displayName: "Search cache TTL (seconds)",
+        subtitle:
+          "In-memory cache of recent search responses to avoid duplicate calls. 0 disables caching.",
+        int: true,
+        min: 0,
+        max: 3600,
+      },
+      300,
+    )
+    .field(
+      "includeScoreBreakdown",
+      "boolean",
+      {
+        displayName: "Include score breakdown",
+        subtitle:
+          "Attach a per-result explanation of why it scored what it did (transparency / debugging).",
+      },
+      false,
     );
 
   // One checkbox per engine — these are the Multi-mode engine toggles.

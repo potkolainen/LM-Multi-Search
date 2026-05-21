@@ -3,10 +3,16 @@
 // but without Playwright or @mozilla/readability — we just strip noise tags,
 // pick the largest reasonable content container, and de-tag/whitespace it.
 
+import { tokenize } from "./ranking";
+
 export interface FetchPageOptions {
   userAgent: string;
   timeoutMs: number;
   maxContentLength: number;
+  // Optional: when set, the extractor will prefer paragraphs containing
+  // these query terms when content has to be truncated. This keeps relevant
+  // sections in the model's context instead of just "first N chars".
+  query?: string;
 }
 
 export interface ExtractedPage {
@@ -104,6 +110,76 @@ function pickMainContainer(html: string): string {
   return best;
 }
 
+// When a page's extracted text exceeds the budget, this picks the most
+// relevant paragraphs (those containing query terms) plus surrounding context
+// up to the byte budget. Falls back to a plain head-truncate when no query is
+// given or nothing matches.
+function squeezeToBudget(text: string, budget: number, query?: string): string {
+  if (text.length <= budget) return text;
+
+  const headFallback = () => text.slice(0, budget - 1) + "…";
+  if (!query) return headFallback();
+
+  const qTokens = new Set(tokenize(query));
+  if (qTokens.size === 0) return headFallback();
+
+  // Split into paragraphs by blank lines.
+  const paragraphs = text.split(/\n\s*\n+/);
+  if (paragraphs.length < 2) return headFallback();
+
+  // Score each paragraph by query-term hits per 100 chars (favours dense
+  // relevant paragraphs over giant menus that happen to mention the term).
+  type Scored = { idx: number; text: string; hits: number; density: number };
+  const scored: Scored[] = paragraphs.map((p, idx) => {
+    const tt = tokenize(p);
+    let hits = 0;
+    for (const t of tt) if (qTokens.has(t)) hits++;
+    const density = p.length > 0 ? (hits * 100) / p.length : 0;
+    return { idx, text: p, hits, density };
+  });
+
+  const anyHit = scored.some((s) => s.hits > 0);
+  if (!anyHit) {
+    // No query terms in body — keep the head so the model still gets something
+    // structured (title is already returned separately).
+    return headFallback();
+  }
+
+  // Always include the first paragraph (usually the lede / intro).
+  const keep = new Set<number>();
+  if (paragraphs[0]?.length > 0) keep.add(0);
+
+  // Take paragraphs in descending relevance order, plus one neighbour on each
+  // side for context, until we run out of budget.
+  const ordered = [...scored]
+    .filter((s) => s.hits > 0)
+    .sort((a, b) => b.density - a.density || b.hits - a.hits);
+
+  let used = 0;
+  const sepCost = 2; // "\n\n"
+  for (const s of ordered) {
+    for (const i of [s.idx - 1, s.idx, s.idx + 1]) {
+      if (i < 0 || i >= paragraphs.length) continue;
+      if (keep.has(i)) continue;
+      const cost = paragraphs[i].length + sepCost;
+      if (used + cost > budget) continue;
+      keep.add(i);
+      used += cost;
+    }
+    if (used >= budget) break;
+  }
+
+  const ordered2 = [...keep].sort((a, b) => a - b);
+  const out: string[] = [];
+  for (let i = 0; i < ordered2.length; i++) {
+    if (i > 0 && ordered2[i] !== ordered2[i - 1] + 1) out.push("[…]");
+    out.push(paragraphs[ordered2[i]]);
+  }
+  let joined = out.join("\n\n");
+  if (joined.length > budget) joined = joined.slice(0, budget - 1) + "…";
+  return joined;
+}
+
 export async function fetchAndExtract(url: string, opts: FetchPageOptions): Promise<ExtractedPage> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs);
@@ -160,8 +236,10 @@ export async function fetchAndExtract(url: string, opts: FetchPageOptions): Prom
     const main = pickMainContainer(body);
     let content = htmlToText(main);
 
-    const truncated = content.length > opts.maxContentLength;
-    if (truncated) content = content.slice(0, opts.maxContentLength) + "…";
+    let truncated = content.length > opts.maxContentLength;
+    if (truncated) {
+      content = squeezeToBudget(content, opts.maxContentLength, opts.query);
+    }
 
     return {
       url,

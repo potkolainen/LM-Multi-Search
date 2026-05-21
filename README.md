@@ -16,9 +16,30 @@ No browser, no Playwright, no API keys — just Node 22's built-in `fetch` and a
 | Tool | What it does |
 |---|---|
 | `list_search_engines` | Returns available engine ids and the current mode/defaults. |
-| `web_search` | Runs a search. In **single** mode hits one engine; in **multi** mode queries several in parallel and returns interleaved + deduped results. |
-| `fetch_page` | Fetches one URL and returns its extracted main text (title + body, nav/ads/scripts stripped). |
-| `web_search_full` | `web_search` + concurrently fetches the top *N* result pages, attaching the extracted content to each result. |
+| `web_search` | Runs a search, **filters junk** (empty titles, redirect wrappers), **dedupes** by normalized URL, **ranks** by host trust + title/snippet query-overlap, returns the **top K** with a `score` (0–1) and `host` per result. |
+| `fetch_page` | Fetches one URL and returns its extracted main text. If you pass `query`, long pages are truncated **query-aware** — paragraphs containing query terms are kept instead of just the first N chars. |
+| `web_search_full` | One-stop: `web_search` + concurrently fetches the top *N* result pages with query-aware extraction. Use this **instead of** `web_search` + multiple `fetch_page` calls. |
+| `get_weather` | Current conditions + 3-day forecast for any city / ZIP / airport code. Backed by [wttr.in](https://wttr.in) (no API key). Use this for weather questions instead of `web_search` — search snippets almost never contain actual temperatures. |
+
+All search responses include `returned`, `dropped_as_noise`, `from_cache`, and `per_engine_counts` for transparency. When the top result score is very low (< 0.35) or zero results survive filtering, an additional `note` field tells the model to rephrase or pick a more specific tool.
+
+## Result ranking & noise reduction
+
+Every `web_search` / `web_search_full` response is post-processed:
+
+1. **Junk drop** — empty titles, search-engine redirect wrappers (`duckduckgo.com/l/?`, `google.com/url?`, etc.), non-http URLs.
+2. **URL normalization** — lowercase host, strip `www.`, strip `#fragment`, drop `utm_*` / `fbclid` / `ref` / `source` / `gclid` tracking params, strip trailing `/`.
+3. **Dedupe** — by normalized URL, keeping the higher-scoring instance.
+4. **Score** = `0.45 · titleQueryOverlap + 0.30 · hostTrust + 0.20 · snippetQueryOverlap + 0.05 · snippetLengthBonus`.
+   - **Host trust** is a built-in map: wikipedia/arxiv ≈ 0.9, .gov 0.85, .edu / github / stackoverflow ≈ 0.8, reddit ≈ 0.55, pinterest ≈ 0.2, unknown 0.5.
+5. **Top-K** — sorted by score, sliced to `topK` (default 8).
+6. **Snippet trim** — cap each snippet to `snippetMaxChars` (default 240).
+
+Turn on `includeScoreBreakdown` (per-chat setting / `MULTI_SEARCH_SCORE_BREAKDOWN=1`) to see per-result `{ host_trust, title_overlap, snippet_overlap, snippet_length_bonus }`.
+
+## In-process cache
+
+A tiny LRU+TTL cache (100 search entries, 50 `web_search_full` entries) deduplicates repeat calls within the same plugin session. Default TTL is 5 minutes. Set `cacheTtlSec` to 0 (or `MULTI_SEARCH_CACHE_TTL=0`) to disable. Responses include `from_cache: true` when served from cache.
 
 ## Supported engines (14)
 
@@ -75,7 +96,11 @@ MCP has no settings UI, so the standalone server is configured purely via env va
 | `MULTI_SEARCH_MODE` | `multi` | `single` \| `multi` | Search strategy. |
 | `MULTI_SEARCH_SINGLE_ENGINE` | `duckduckgo` | any engine id | Engine used in single mode. |
 | `MULTI_SEARCH_MULTI_ENGINES` | `duckduckgo,brave,bing,wikipedia` | comma list | Engines queried in multi mode. |
-| `MULTI_SEARCH_MAX_RESULTS` | `5` | 1–20 | Results per engine cap. |
+| `MULTI_SEARCH_MAX_RESULTS` | `5` | 1–20 | Raw results per engine cap. |
+| `MULTI_SEARCH_TOP_K` | `8` | 1–25 | Final top-K returned after ranking. |
+| `MULTI_SEARCH_SNIPPET_MAX` | `240` | 80–2000 | Snippet length cap (chars). |
+| `MULTI_SEARCH_CACHE_TTL` | `300` | 0–3600 sec | Search-cache TTL. `0` = disabled. |
+| `MULTI_SEARCH_SCORE_BREAKDOWN` | `0` | `0`/`1` | Include per-result scoring breakdown for transparency. |
 | `MULTI_SEARCH_FETCH_TOP_N` | `3` | 0–10 | Pages fetched by `web_search_full`. |
 | `MULTI_SEARCH_FETCH_CONCURRENCY` | `3` | 1–8 | Parallel page fetches. |
 | `MULTI_SEARCH_REQUEST_TIMEOUT` | `15000` | 1000–60000 ms | Per-engine HTTP timeout. |
@@ -112,7 +137,11 @@ When loaded as a plugin you get a **per-chat config panel** with these fields:
 | `searchEnabled` | ✅ on | Kill-switch. When off, no tools are exposed to the model at all. |
 | `mode` | `single` | `single` or `multi`. Only one `web_search` tool is exposed at a time, matching this mode. |
 | `singleEngine` | `duckduckgo` | Engine used in single mode. |
-| `maxResultsPerEngine` | `5` | Results-per-engine cap (1–20). |
+| `maxResultsPerEngine` | `5` | Raw results-per-engine cap (1–20). |
+| `topK` | `8` | Final number of best-scoring results returned after ranking (1–25). |
+| `snippetMaxChars` | `240` | Snippet length cap to save context (80–2000). |
+| `cacheTtlSec` | `300` | Search-cache TTL in seconds. `0` disables caching. |
+| `includeScoreBreakdown` | off | Attach per-result scoring breakdown for transparency / debugging. |
 | `fetchTopN` | `3` | Pages fetched by `web_search_full` (0–10). |
 | `fetchConcurrency` | `3` | Parallel page fetches (1–8). |
 | `Multi: <Engine>` × 14 | duckduckgo / brave / bing / wikipedia | One checkbox per engine — pick which to include in multi mode. |
@@ -157,8 +186,11 @@ It is **not** a full Readability re-implementation — for pathological pages (h
 
 ```
 src/
-  engines.ts          # 14 search engines + shared helpers (fetch with timeout, dedupe, etc.)
-  extract.ts          # HTML → main-text extractor for fetch_page / web_search_full
+  engines.ts          # 14 search engines + shared helpers (fetch with timeout, etc.)
+  extract.ts          # HTML → main-text extractor (with query-aware truncation)
+  ranking.ts          # URL normalization, dedupe, host-trust scoring, top-K filter
+  cache.ts            # Tiny in-process LRU + TTL cache
+  weather.ts          # wttr.in client for the get_weather tool
   configSchematics.ts # LM Studio plugin per-chat + global config schema
   toolsProvider.ts    # LM Studio plugin tool registration
   index.ts            # LM Studio plugin entry point
