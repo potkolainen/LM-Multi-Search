@@ -1,0 +1,26 @@
+{
+  "name": "lms-plugin-multi-search",
+  "version": "0.1.0",
+  "description": "Online web search for LM Studio. 14 engines + parallel multi-engine search.",
+  "main": "dist/index.js",
+  "bin": {
+    "multi-search-mcp": "dist/mcp.js"
+  },
+  "scripts": {
+    "dev": "lms dev",
+    "push": "lms push",
+    "build": "tsc",
+    "start:mcp": "node dist/mcp.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@lmstudio/sdk": "1.4.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.8",
+    "typescript": "^5.4.0"
+  }
+}
