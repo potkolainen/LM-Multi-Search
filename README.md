@@ -55,7 +55,7 @@ A tiny LRU+TTL cache (100 search entries, 50 `web_search_full` entries) deduplic
 ## Install
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/potkolainen/LM-Multi-Online-Search-plugin.git
 cd "Multi search"
 npm install
 npm run build
